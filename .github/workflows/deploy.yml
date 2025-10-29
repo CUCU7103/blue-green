@@ -40,26 +40,57 @@ jobs:
           fi
           echo "Deploying to target: $TARGET"
 
-      # 6️⃣ SSH 키 준비
+      # 6️⃣ SSH 키 준비 (+ 줄바꿈/권한/포맷 점검)
       - name: Setup SSH key
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          if [ "$TARGET" = "server1" ]; then
-            echo '${{ secrets.EC2_KEY_SERVER1 }}' > ~/.ssh/ec2_key.pem
+          if [ "${TARGET:-}" = "server1" ]; then
+            printf '%s' '${{ secrets.EC2_KEY_SERVER1 }}' > ~/.ssh/ec2_key.pem
           else
-            echo '${{ secrets.EC2_KEY_SERVER2 }}' > ~/.ssh/ec2_key.pem
+            printf '%s' '${{ secrets.EC2_KEY_SERVER2 }}' > ~/.ssh/ec2_key.pem
           fi
-          chmod 600 ~/.ssh/ec2_key.pem
-          ssh-keyscan -H $HOST >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      # 7️⃣ JAR + Dockerfile을 EC2로 배포
+          # Windows 줄바꿈(CRLF) 방지
+          perl -pi -e 's/\r\n?/\n/g' ~/.ssh/ec2_key.pem
+
+          # 권한 설정
+          chmod 600 ~/.ssh/ec2_key.pem
+
+          # known_hosts 등록
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          # ✅ 키 포맷/권한/존재 확인(민감정보 미노출)
+          echo "=== SSH key quick checks ==="
+          test -s ~/.ssh/ec2_key.pem || (echo "Key file empty" && exit 1)
+          grep -q "BEGIN " ~/.ssh/ec2_key.pem || (echo "Missing BEGIN header" && exit 1)
+          grep -q "END " ~/.ssh/ec2_key.pem || (echo "Missing END footer" && exit 1)
+          ls -l ~/.ssh
+          echo "BEGIN/END headers:"
+          head -n1 ~/.ssh/ec2_key.pem | sed 's/.*/(redacted) BEGIN .../'
+          tail -n1 ~/.ssh/ec2_key.pem | sed 's/.*/(redacted) END .../'
+          echo "Known hosts entries for $HOST:"
+          grep -F "$HOST" ~/.ssh/known_hosts || echo "No known_hosts entry (ok if StrictHostKeyChecking=no)"
+    
+
+      # 7️⃣ JAR + Dockerfile을 EC2로 전송 (SSH/SCP 디버그: -vvv, 지정키만: IdentitiesOnly)
       - name: Deploy app files to EC2
+        shell: bash
         run: |
+          set -euo pipefail
           echo "Deploying to $HOST (Target: $TARGET)"
-          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@$HOST "mkdir -p /home/ubuntu/app"
-          scp -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no build/libs/*.jar ubuntu@$HOST:/home/ubuntu/app/
-          scp -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no Dockerfile ubuntu@$HOST:/home/ubuntu/app/
-          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@$HOST "chmod 755 /home/ubuntu/app/*.jar"
+          SSH_OPTS="-i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no -o IdentitiesOnly=yes"
+
+          # 연결 테스트(상세 로그)
+          ssh -vvv $SSH_OPTS ubuntu@"$HOST" "echo Connected to \$(hostname) && mkdir -p /home/ubuntu/app"
+
+          # 파일 복사(상세 로그)
+          scp -vvv $SSH_OPTS build/libs/*.jar ubuntu@"$HOST":/home/ubuntu/app/
+          scp -vvv $SSH_OPTS Dockerfile ubuntu@"$HOST":/home/ubuntu/app/
+
+          # 권한 설정
+          ssh -vvv $SSH_OPTS ubuntu@"$HOST" "chmod 755 /home/ubuntu/app/*.jar"
 
       # 8️⃣ Docker 컨테이너 재시작 (Dockerfile 사용)
       - name: Restart application with Docker
